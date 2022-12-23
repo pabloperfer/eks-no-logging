@@ -1,0 +1,177 @@
+Resources:
+  Recorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties: 
+      Name: CustomRecorder
+      RoleARN:
+        Fn::ImportValue:
+          !Sub '${AWS::AccountId}-ConfigRoleArn'
+
+  DeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    DependsOn: RecorderBucketPolicy
+    Properties:
+      S3BucketName: !Ref DeliveryS3Bucket
+      SnsTopicARN: !Ref MySNSTopic
+
+  DeliveryS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Join:
+          - ''
+          - - { Ref: 'AWS::AccountId' }
+            - 'deliverybucket'
+      AccessControl: Private
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DeliveryS3Bucket
+    Properties:
+      Handler: index.lambda_handler
+      FunctionName: EmptyS3Bucket
+      Role: !GetAtt  LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import logging
+          import sys
+          logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+
+
+          #Define logging properties
+          log = logging.getLogger()
+          
+
+          s3 = boto3.client('s3')
+
+          def lambda_handler(event, context):
+            responseData = {}
+            physicalResourceId = {}
+            print(event)
+      
+            if event['RequestType'] == 'Create':
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              
+            if event['RequestType'] == 'Delete':
+              try:
+                bucket_name = event['ResourceProperties']['BucketName']
+
+              # Check if versioning enabled
+
+                response = s3.get_bucket_versioning(Bucket=bucket_name)
+              
+                if 'Status' in response and response['Status'] == 'Enabled':
+                  paginator = s3.get_paginator('list_object_versions')
+                  page_iterator = paginator.paginate(Bucket=bucket_name)
+                  for page in page_iterator:
+                    if 'DeleteMarkers' in page:
+                      delete_markers = page['DeleteMarkers']
+                      if delete_markers is not None:
+                        for delete_marker in delete_markers:
+                          key = delete_marker['Key']
+                          versionId = delete_marker['VersionId']
+                          s3.delete_object(Bucket=bucket_name, Key=key, VersionId=versionId)
+                    if 'Versions' in page and page['Versions'] is not None:
+                      versions = page['Versions']
+                      for version in versions:
+                          key = version['Key']
+                          versionId = version['VersionId']
+                          s3.delete_object(Bucket=bucket_name, Key=key, VersionId=versionId)
+                  object_paginator = s3.get_paginator('list_objects_v2')
+                  page_iterator = object_paginator.paginate(Bucket=bucket_name)
+                  for page in page_iterator:
+                    if 'Contents' in page:
+                      for content in page['Contents']:
+                          key = content['Key']
+                          s3.delete_object(Bucket=bucket_name, Key=content['Key'])
+                
+                else:
+                  object_paginator = s3.get_paginator('list_objects_v2')
+                  page_iterator = object_paginator.paginate(Bucket=bucket_name)
+                  for page in page_iterator:
+                    if 'Contents' in page:
+                      for content in page['Contents']:
+                        key = content['Key']
+                        s3.delete_object(Bucket=bucket_name, Key=content['Key'])
+                  
+                cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                         responseData, physicalResourceId)
+                
+
+              except Exception:
+                log.exception("Lambda execution has failed!")
+                cfnresponse.send(event, context, cfnresponse.FAILED,
+                         responseData, physicalResourceId)
+                
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+  CustomResourceEmptyBucket:
+    Type: Custom::EmptyS3Bucket
+    DependsOn: LambdaFunction
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      BucketName: !Ref DeliveryS3Bucket
+
+  MySNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Config Delivery SNS Topic
+      TopicName: Config-Delivery-SNS-Topic
+
+  RecorderBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DeliveryS3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action:
+              - s3:PutObject
+            Resource:
+              - !Sub 'arn:aws:s3:::${DeliveryS3Bucket}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                AWS:SourceAccount: !Ref AWS::AccountId
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action:
+             - s3:ListBucket
+             - s3:GetBucketAcl
+            Resource: !Sub 'arn:aws:s3:::${DeliveryS3Bucket}'
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+
+Outputs:
+  RoleArn:
+    Value: !Ref MySNSTopic
+    Export:
+      Name: !Join [ "", [ !Ref "AWS::AccountId", ConfigSNSTopicARN ] ]
+  
+   
+
+

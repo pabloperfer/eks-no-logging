@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for EventBridge layer
+
+Parameters:
+  CentralEventBusName: 
+    Type: String
+    Default: Central
+
+  ManagementAccount: 
+    Type: String
+
+Conditions:
+  CreateManagementResources: !Equals 
+    - !Ref AWS::AccountId
+    - !Ref ManagementAccount
+
+  CreateTargetResources: 
+    !Not [!Equals [!Ref AWS::AccountId, !Ref ManagementAccount]]
+
+Resources:
+  CentralEventBus: 
+    Condition: CreateManagementResources
+    Type: AWS::Events::EventBus
+    Properties: 
+      Name: !Ref CentralEventBusName
+
+  EventBusPolicy0:
+    Condition: CreateManagementResources
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      StatementId: allow_all_accounts_from_organization_to_put_events
+      EventBusName: !Ref CentralEventBus
+      Statement:
+        Sid: allow_all_accounts_from_organization_to_put_events
+        Effect: Allow
+        Principal: '*'
+        Action: events:PutEvents
+        Resource: !GetAtt CentralEventBus.Arn
+     
+  EventRule0:
+    Condition: CreateManagementResources
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref CentralEventBus
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+        detail:
+          messageType:
+            - ComplianceChangeNotification
+          configRuleName:
+            - prefix: OrgConfigRule-eks-no-logging-
+          resourceType:
+            - AWS::EKS::Cluster
+          newEvaluationResult:
+            complianceType:
+              - NON_COMPLIANT
+      Name: eks-logging
+      State: ENABLED
+      Targets:
+        - Id: Idf3120de5-2d89-44ec-8adb-4ee5f75c778b
+          Arn: !GetAtt SSMLambdaFunction.Arn
+          InputTransformer:
+            InputPathsMap:
+              Account: $.detail.awsAccountId
+              ClusterName: $.detail.resourceId
+              Region: $.detail.awsRegion
+            InputTemplate: >
+              {"ClusterName":[<ClusterName>],"Account":[<Account>],"Region":[<Region>]}
+
+
+
+  LambdaSSMExecutionRole:
+    Condition: CreateManagementResources
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MyLambdaExecutionPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:StartAutomationExecution
+                  - iam:PassRole
+                Resource: "*"
+
+  SSMLambdaFunction:
+    Condition: CreateManagementResources
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile:
+          !Sub |
+          
+            import boto3
+           
+            def lambda_handler(event, context):
+              print(event)
+              ClusterName = event['ClusterName']
+              Account = event['Account']
+              Region = event['Region']
+          
+              ssm = boto3.client('ssm')
+          
+          
+              # Execute the SSM Automation document
+              response = ssm.start_automation_execution(
+                  DocumentName='arn:aws:ssm:us-east-1:${ManagementAccount}:document/EKS-Enable-Logging',
+                  Parameters={
+                      'ClusterName': ClusterName,
+                      'AutomationAssumeRole' : ['arn:aws:iam::${ManagementAccount}:role/AWS-SystemsManager-AutomationAdministrationRole']
+                  },
+                   TargetLocations=[
+                  {
+                      'Accounts': Account, 
+                      'Regions': Region,
+                      'ExecutionRoleName': 'AWS-SystemsManager-AutomationExecutionRole' 
+                              }
+                ]
+              )
+          
+              return response
+      FunctionName: SSMLambdaFunction
+      Role: !GetAtt LambdaSSMExecutionRole.Arn
+      Runtime: python3.8
+      Handler: index.lambda_handler
+
+  EventPermission:
+    Condition: CreateManagementResources
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SSMLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !GetAtt EventRule0.Arn
+
+
+  EventRuleOnTarget:
+    Type: AWS::Events::Rule
+    Condition: CreateTargetResources
+    Properties:
+      EventBusName: default
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+        detail:
+          messageType:
+            - ComplianceChangeNotification
+          configRuleName:
+            - prefix: OrgConfigRule-eks-no-logging-
+          resourceType:
+            - AWS::EKS::Cluster
+          newEvaluationResult:
+            complianceType:
+              - NON_COMPLIANT
+      Name: ssmexecrule
+      State: ENABLED
+      Targets:
+        - Id: Id8f7334cc-8839-4162-86e3-524f1d63e4fb
+          Arn: !Sub 'arn:aws:events:us-east-1:${ManagementAccount}:event-bus/${CentralEventBusName}'
+          RoleArn: !GetAtt TargetEventBusRole.Arn
+
+
+  TargetEventBusRole:
+    Type: AWS::IAM::Role
+    Condition: CreateTargetResources
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: TargetEventBusPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub 'arn:aws:events:us-east-1:${ManagementAccount}:event-bus/${CentralEventBusName}'
+
+
+
+
+ 
