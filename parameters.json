@@ -1,0 +1,13 @@
+{
+  "Version": "1.0",
+  "Parameters": {
+    "RuleName": "eks-no-logging",
+    "Description": "eks-no-logging",
+    "SourceRuntime": "python3.9",
+    "CodeKey": "eks-no-loggingus-east-1.zip",
+    "InputParameters": "{}",
+    "OptionalParameters": "{}",
+    "SourceEvents": "AWS::EKS::Cluster"
+  },
+  "Tags": "[]"
+}

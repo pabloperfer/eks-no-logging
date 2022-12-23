@@ -1,0 +1,164 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: SSM EKS Logging Document
+Parameters:
+  pOrganizationId:
+    Type: String
+
+
+Resources:
+  EKSLoggingDocument: 
+    Type: AWS::SSM::Document
+    Properties:
+      Name: EKS-Enable-Logging
+      Content:
+        description: Enables logging on EKS Control plan
+        schemaVersion: '0.3'
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          AutomationAssumeRole:
+            description: (Optional) The ARN of the role that allows Automation to perform the actions on your behalf.
+            type: String
+          ClusterName:
+            description: (Required) The name of the EKS Cluster whose logging will be enabled.
+            type: String
+      
+        mainSteps:
+
+        - name: WaitUntilClusterActive
+          inputs:
+            name: '{{ClusterName}}'
+            Service: eks
+            Api: DescribeCluster
+            PropertySelector: "$.cluster.status"
+            DesiredValues:
+            - 'ACTIVE'
+          action: 'aws:waitForAwsResourceProperty'
+          nextStep: UpdateClusterConfigStep
+          
+        - name: UpdateClusterConfigStep
+          inputs:
+            name: '{{ClusterName}}'
+            Service: eks
+            logging:
+              clusterLogging:
+              - 
+                types:
+                  - api
+                  - audit
+                  - authenticator
+                  - controllerManager
+                  - scheduler
+                enabled: true
+            Api: UpdateClusterConfig
+          action: 'aws:executeAwsApi'
+          isEnd: true          
+      DocumentFormat: YAML
+      DocumentType: Automation
+
+  ShareSSMAutomationDocument:
+    Type: Custom::ShareSSMAutomationDocument
+    DependsOn: 
+      - EKSLoggingDocument
+      - ShareSSMLambdaFunction
+    Properties:
+      ServiceToken: !GetAtt ShareSSMLambdaFunction.Arn
+      SSMAutomationDocumentName: !Ref EKSLoggingDocument
+      OrganizationId: !Ref pOrganizationId
+
+  ShareSSMLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: EKSLoggingDocument
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          ssm = boto3.client('ssm')
+          organizations = boto3.client('organizations')
+
+          def lambda_handler(event, context):
+            if event['RequestType'] == 'Create':
+              try:
+                # Get the SSM Automation document name and organization ID from the event
+                document_name = event['ResourceProperties']['SSMAutomationDocumentName']
+                organization_id = event['ResourceProperties']['OrganizationId']
+
+                # Get a list of all accounts within the organization
+                accounts = organizations.list_accounts_for_parent(
+                  ParentId=organization_id
+                )
+
+                account_ids = []
+                for account in accounts['Accounts']:
+                  account_ids.append(account['Id'])
+              
+                # Use the SSM Automation document to share the document within the organization
+                ssm.modify_document_permission(Name=document_name,PermissionType='Share',AccountIdsToAdd=account_ids)
+
+              
+                # Send a success response to CloudFormation
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+              except Exception as e:
+                # Send a failure response to CloudFormation
+                cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+            if event['RequestType'] == 'Delete':
+              try:
+                # Get the SSM Automation document name and organization ID from the event
+                document_name = event['ResourceProperties']['SSMAutomationDocumentName']
+                organization_id = event['ResourceProperties']['OrganizationId']
+
+                # Get a list of all accounts within the organization
+                accounts = organizations.list_accounts_for_parent(
+                  ParentId=organization_id
+                )
+
+                account_ids = []
+                for account in accounts['Accounts']:
+                  account_ids.append(account['Id'])
+              
+                # Use the SSM Automation document to share the document within the organization
+                ssm.modify_document_permission(Name=document_name,PermissionType='Share',AccountIdsToRemove=account_ids)
+
+              
+                # Send a success response to CloudFormation
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+              except Exception as e:
+                # Send a failure response to CloudFormation
+                cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})        
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      FunctionName: EKSLoggingDocument
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # Allow the Lambda function to assume this role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      # Attach the necessary permissions to the role
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+        - arn:aws:iam::aws:policy/AWSOrganizationsReadOnlyAccess
+     
+
+Outputs:
+  SSMDocumentName:
+    Description: The name of the SSM document
+    Value: !Ref EKSLoggingDocument
+    Export:
+      Name: EKSLoggingDocument
+      
+    
